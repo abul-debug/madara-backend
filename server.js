@@ -1,6 +1,6 @@
 const express = require("express");
 const cors = require("cors");
-const fetch = require("node-fetch");
+const puppeteer = require("puppeteer");
 
 const app = express();
 app.use(cors());
@@ -9,7 +9,7 @@ app.use(express.json());
 // ================== CONFIG ==================
 const API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json";
 const DB_URL = "https://madara-62f7b-default-rtdb.firebaseio.com";
-const CHECK_INTERVAL = 15000; // 15 sec pe check (save sirf naya result pe)
+const CHECK_INTERVAL = 20000; // 20 sec
 
 let lastKnownIssue = null;
 let currentPrediction = {
@@ -19,7 +19,7 @@ let currentPrediction = {
   historyCount: 0
 };
 
-// ================== FIREBASE HELPERS ==================
+// ================== FIREBASE ==================
 async function loadHistory() {
   try {
     const res = await fetch(`${DB_URL}/wingo_results.json`);
@@ -68,11 +68,9 @@ function predict(historyNumbers) {
   const latest = historyNumbers[historyNumbers.length - 1];
   const prevNumbers = [];
 
-  // oldest → newest
-  // jab number mile, uska PEHLE wala (upar wala) lo
   for (let i = 1; i < historyNumbers.length; i++) {
     if (historyNumbers[i] === latest) {
-      prevNumbers.push(historyNumbers[i - 1]);
+      prevNumbers.push(historyNumbers[i - 1]); // upar wala
     }
   }
 
@@ -80,8 +78,7 @@ function predict(historyNumbers) {
     return { prediction: "BIG", source: "No previous matches" };
   }
 
-  let big = 0;
-  let small = 0;
+  let big = 0, small = 0;
   prevNumbers.forEach((n) => {
     if (n >= 5) big++;
     else small++;
@@ -90,7 +87,7 @@ function predict(historyNumbers) {
   let prediction;
   if (big > small) prediction = "BIG";
   else if (small > big) prediction = "SMALL";
-  else prediction = latest >= 5 ? "SMALL" : "BIG"; // tie
+  else prediction = latest >= 5 ? "SMALL" : "BIG";
 
   return {
     prediction,
@@ -98,24 +95,38 @@ function predict(historyNumbers) {
   };
 }
 
-// ================== WIN GO API (403 FIX HEADERS) ==================
+// ================== PUPPETEER FETCH (Real Browser) ==================
 async function fetchGameResults() {
+  let browser = null;
   try {
-    const res = await fetch(API_URL + "?ts=" + Date.now(), {
-      method: "GET",
-      headers: {
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://draw.ar-lottery01.com/",
-        "Origin": "https://draw.ar-lottery01.com"
-      }
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process"
+      ]
     });
 
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    );
+
+    const url = API_URL + "?ts=" + Date.now();
+    const response = await page.goto(url, {
+      waitUntil: "networkidle2",
+      timeout: 30000
+    });
+
+    if (!response || !response.ok()) {
+      throw new Error("HTTP " + (response ? response.status() : "no response"));
+    }
+
+    const text = await page.evaluate(() => document.body.innerText);
+    const data = JSON.parse(text);
 
     let list = [];
     if (data?.data?.list) list = data.data.list;
@@ -125,8 +136,10 @@ async function fetchGameResults() {
 
     return list;
   } catch (e) {
-    console.log("API error:", e.message);
+    console.log("Puppeteer API error:", e.message);
     return null;
+  } finally {
+    if (browser) await browser.close();
   }
 }
 
@@ -138,7 +151,7 @@ function getNumber(item) {
   return n !== undefined && n !== null ? Number(n) : null;
 }
 
-// ================== MAIN WORKER (sirf naya result pe) ==================
+// ================== WORKER (sirf naya result pe save) ==================
 async function worker() {
   const list = await fetchGameResults();
   if (!list || list.length === 0) {
@@ -146,7 +159,6 @@ async function worker() {
     return;
   }
 
-  // latest from API
   const sorted = [...list].sort((a, b) => {
     try {
       return Number(BigInt(getIssue(b)) - BigInt(getIssue(a)));
@@ -161,19 +173,16 @@ async function worker() {
 
   if (!issue || number === null || isNaN(number)) return;
 
-  // Agar same period hai to kuch mat karo
+  // Same period → skip
   if (issue === lastKnownIssue) {
     return;
   }
 
-  // NAYA RESULT AAYA
   console.log("New result:", issue, number);
   lastKnownIssue = issue;
 
-  // Firebase history load karo
   let history = await loadHistory();
 
-  // Naya result save karo (agar pehle se nahi hai)
   const exists = history.some((h) => String(h.period) === issue);
   if (!exists) {
     const item = {
@@ -185,7 +194,22 @@ async function worker() {
     history.push(item);
   }
 
-  // sort again
+  // Also save other items from this batch (build history faster)
+  for (const it of list) {
+    const p = String(getIssue(it));
+    const n = getNumber(it);
+    if (!p || n === null || isNaN(n)) continue;
+    if (history.some((h) => String(h.period) === p)) continue;
+
+    const item = {
+      period: p,
+      number: n,
+      result: n >= 5 ? "BIG" : "SMALL"
+    };
+    await saveResult(item);
+    history.push(item);
+  }
+
   history.sort((a, b) => {
     try {
       return Number(BigInt(a.period) - BigInt(b.period));
@@ -194,7 +218,6 @@ async function worker() {
     }
   });
 
-  // Next period prediction
   let nextPeriod;
   try {
     nextPeriod = String(BigInt(issue) + 1n);
@@ -214,13 +237,13 @@ async function worker() {
     lastIssue: issue
   };
 
-  console.log("Prediction ready:", currentPrediction);
+  console.log("Prediction ready:", currentPrediction.prediction, "| History:", history.length);
 }
 
-// ================== API FOR FRONTEND ==================
+// ================== API ==================
 app.get("/", (req, res) => {
   res.json({
-    status: "MADARA Backend Running",
+    status: "MADARA Backend Running (Puppeteer)",
     prediction: currentPrediction
   });
 });
@@ -237,8 +260,11 @@ app.get("/history-count", async (req, res) => {
 // ================== START ==================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log("Server running on port", PORT);
-  worker(); // pehli baar
-  setInterval(worker, CHECK_INTERVAL);
+  // pehli baar thoda delay (Chrome download ho sakta hai)
+  setTimeout(() => {
+    worker();
+    setInterval(worker, CHECK_INTERVAL);
+  }, 3000);
 });
