@@ -98,15 +98,22 @@ function predict(historyNumbers) {
   };
 }
 
-// ================== WIN GO API ==================
+// ================== WIN GO API (403 FIX HEADERS) ==================
 async function fetchGameResults() {
   try {
     const res = await fetch(API_URL + "?ts=" + Date.now(), {
+      method: "GET",
       headers: {
-        Accept: "application/json",
-        "Cache-Control": "no-cache"
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://draw.ar-lottery01.com/",
+        "Origin": "https://draw.ar-lottery01.com"
       }
     });
+
     if (!res.ok) throw new Error("HTTP " + res.status);
     const data = await res.json();
 
