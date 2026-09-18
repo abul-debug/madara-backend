@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
 
 const app = express();
 app.use(cors());
@@ -68,9 +69,11 @@ function predict(historyNumbers) {
   const latest = historyNumbers[historyNumbers.length - 1];
   const prevNumbers = [];
 
+  // oldest → newest
+  // jab number mile, uska PEHLE wala (upar wala) lo
   for (let i = 1; i < historyNumbers.length; i++) {
     if (historyNumbers[i] === latest) {
-      prevNumbers.push(historyNumbers[i - 1]); // upar wala
+      prevNumbers.push(historyNumbers[i - 1]);
     }
   }
 
@@ -78,7 +81,8 @@ function predict(historyNumbers) {
     return { prediction: "BIG", source: "No previous matches" };
   }
 
-  let big = 0, small = 0;
+  let big = 0;
+  let small = 0;
   prevNumbers.forEach((n) => {
     if (n >= 5) big++;
     else small++;
@@ -87,7 +91,7 @@ function predict(historyNumbers) {
   let prediction;
   if (big > small) prediction = "BIG";
   else if (small > big) prediction = "SMALL";
-  else prediction = latest >= 5 ? "SMALL" : "BIG";
+  else prediction = latest >= 5 ? "SMALL" : "BIG"; // tie
 
   return {
     prediction,
@@ -95,19 +99,16 @@ function predict(historyNumbers) {
   };
 }
 
-// ================== PUPPETEER FETCH (Real Browser) ==================
+// ================== PUPPETEER FETCH (Render Chrome Fix) ==================
 async function fetchGameResults() {
   let browser = null;
   try {
     browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process"
-      ]
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true
     });
 
     const page = await browser.newPage();
@@ -118,7 +119,7 @@ async function fetchGameResults() {
     const url = API_URL + "?ts=" + Date.now();
     const response = await page.goto(url, {
       waitUntil: "networkidle2",
-      timeout: 30000
+      timeout: 45000
     });
 
     if (!response || !response.ok()) {
@@ -146,6 +147,7 @@ async function fetchGameResults() {
 function getIssue(item) {
   return item.issueNumber || item.issue || item.period || item.IssueNumber || "";
 }
+
 function getNumber(item) {
   const n = item.number ?? item.Number ?? item.result ?? item.Result ?? item.openNumber;
   return n !== undefined && n !== null ? Number(n) : null;
@@ -183,18 +185,7 @@ async function worker() {
 
   let history = await loadHistory();
 
-  const exists = history.some((h) => String(h.period) === issue);
-  if (!exists) {
-    const item = {
-      period: issue,
-      number: number,
-      result: number >= 5 ? "BIG" : "SMALL"
-    };
-    await saveResult(item);
-    history.push(item);
-  }
-
-  // Also save other items from this batch (build history faster)
+  // Save latest + batch results
   for (const it of list) {
     const p = String(getIssue(it));
     const n = getNumber(it);
@@ -260,9 +251,8 @@ app.get("/history-count", async (req, res) => {
 // ================== START ==================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log("Server running on port", PORT);
-  // pehli baar thoda delay (Chrome download ho sakta hai)
   setTimeout(() => {
     worker();
     setInterval(worker, CHECK_INTERVAL);
